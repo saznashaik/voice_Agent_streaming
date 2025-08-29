@@ -7,4 +7,6 @@ pyaudio
 orjson
 requests
 python-dotenv
-tavily
+tavily-python
+
+
