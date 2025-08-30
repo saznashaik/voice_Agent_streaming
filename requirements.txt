@@ -7,3 +7,4 @@ Jinja2
 python-multipart
 google-generativeai
 websockets
+gunicorn
