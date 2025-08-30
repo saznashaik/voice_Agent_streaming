@@ -4,7 +4,7 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --worker-class eventlet -w 1 app:app --bind 0.0.0.0:$PORT --timeout 0 --graceful-timeout 0
+    startCommand: gunicorn --worker-class eventlet -w 1 main:app --bind 0.0.0.0:$PORT --timeout 0 --graceful-timeout 0
     envVars:
       - key: GEMINI_API_KEY
         sync: false
@@ -18,3 +18,4 @@ services:
         sync: false
       - key: LOCAL_AUDIO
         value: "false"
+
