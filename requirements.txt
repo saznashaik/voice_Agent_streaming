@@ -1,0 +1,15 @@
+flask==3.0.3
+flask-socketio==5.3.6
+gunicorn==22.0.0
+eventlet==0.36.1
+
+websocket-client==1.8.0
+websockets==12.0
+requests==2.32.3
+python-dotenv==1.0.1
+orjson==3.10.7
+google-generativeai==0.7.2
+tavily-python==0.3.8
+
+# Local-only audio (do not install on Render); enable via LOCAL_AUDIO=true locally
+# pyaudio==0.2.14
