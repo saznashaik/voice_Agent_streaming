@@ -1,769 +1,746 @@
+# app.py
+# Flask UI + Single-Port WebSocket bridge for browser audio
+# Browser captures mic (WebRTC/MediaStream + AudioWorklet at 16 kHz PCM),
+# sends binary PCM to /audio WS -> forwarded to AssemblyAI realtime WS.
+# Server streams Murf TTS WAV back over the same /audio WS for WebAudio playback.
+# PyAudio is removed; suitable for Render single-port deployment.
+
 import os
-from dotenv import load_dotenv
-import logging
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from pathlib import Path as PathLib
+import time
 import json
-import asyncio
-import config
-from typing import Type, List, Optional
 import base64
+import threading
+import asyncio
+from datetime import datetime, timezone
+from urllib.parse import urlencode
+from typing import Optional, Set
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from flask import Flask, render_template_string, jsonify, request, send_from_directory
+
+# WebSocket server for browser <-> server
 import websockets
-from datetime import datetime
-import re
+from websockets.server import serve as ws_serve
 
-import assemblyai as aai
-from assemblyai.streaming.v3 import (
-    BeginEvent,
-    StreamingClient,
-    StreamingClientOptions,
-    StreamingError,
-    StreamingEvents,
-    StreamingParameters,
-    TerminationEvent,
-    TurnEvent,
-)
+# AssemblyAI client uses websocket-client
+import websocket as ws_client
+
+# JSON perf
+import orjson
+
+# LLM and deps
 import google.generativeai as genai
-import httpx
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import requests
+from tavily import TavilyClient
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-app = FastAPI()
+# ------------------- CONFIG -------------------
+FLASK_HOST = "0.0.0.0"
+# Render sets PORT; fall back to 5000 locally
+FLASK_PORT = int(os.getenv("PORT", os.getenv("FLASK_PORT", "5000")))
 
-BASE_DIR = PathLib(__file__).resolve().parent
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+SAMPLE_RATE_STT = 16000
 
-# Global variables to store API keys (will be updated per session)
-current_api_keys = {
-    "gemini": config.GEMINI_API_KEY,
-    "assemblyai": config.ASSEMBLYAI_API_KEY,
-    "murf": config.MURF_API_KEY,
-    "tavily": config.TAVILY_API_KEY
+ASSEMBLY_WS_BASE = "wss://streaming.assemblyai.com/v3/ws"
+ASSEMBLY_PARAMS = {"sample_rate": SAMPLE_RATE_STT, "format_turns": True}
+ASSEMBLY_ENDPOINT = f"{ASSEMBLY_WS_BASE}?{urlencode(ASSEMBLY_PARAMS)}"
+
+MURF_WS_URL = "wss://api.murf.ai/v1/speech/stream-input"
+
+CHAT_HISTORY_FILE = "chat_history.jsonl"
+RECORD_RAW_WAV = False  # optional; off by default for Render
+
+AUDIO_WS_PATH = "/audio"  # browser WebSocket path
+
+# ------------------- User keys -------------------
+user_keys = {
+    "GEMINI_API_KEY": None,
+    "MURF_API_KEY": None,
+    "ASSEMBLYAI_API_KEY": None,
+    "TAVILY_API_KEY": None,
+    "NEWS_API_KEY": None,
 }
 
-# Initialize Gemini model with default key if available
-if config.GEMINI_API_KEY:
-    genai.configure(api_key=config.GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-else:
-    gemini_model = None
-    logging.warning("Gemini model not initialized. GEMINI_API_KEY is missing.")
+# ------------------- Helpers -------------------
+class ChatHistory:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        if not os.path.exists(self.path):
+            with open(self.path, "w", encoding="utf-8") as f:
+                pass
 
-
-def get_gemini_model(api_key: str = None):
-    """Get or create Gemini model with the provided API key"""
-    try:
-        if api_key:
-            genai.configure(api_key=api_key)
-            return genai.GenerativeModel('gemini-1.5-flash')
-        elif gemini_model:
-            return gemini_model
-        else:
-            return None
-    except Exception as e:
-        logging.error(f"Error configuring Gemini model: {e}")
-        return None
-
-
-def _detect_weather_intent(user_text: str) -> Optional[str]:
-    if not user_text:
-        return None
-    text = user_text.lower().strip()
-    # Try common phrasings: "weather in <loc>", "what's the weather in <loc>", "forecast for <loc>"
-    match = re.search(r"(weather|temperature|forecast)\s+(in|at|for)\s+(.+)$", text)
-    if match:
-        location = match.group(3).strip().rstrip("?.!")
-        # Strip leading articles
-        location = re.sub(r"^(the|a|an)\s+", "", location)
-        return location if location else None
-    return None
-
-
-def _detect_website_intent(user_text: str) -> Optional[str]:
-    """Detect if user wants to open a website and extract the website name/URL"""
-    if not user_text:
-        return None
-    
-    text = user_text.lower().strip()
-    logging.info(f"🔍 Checking website intent for: '{text}'")
-    
-    # Common patterns for opening websites - more specific patterns
-    patterns = [
-        r"^open\s+(.+?)(?:\s+(?:website|site|page))?(?:\.|!|\?|$)",
-        r"^go\s+to\s+(.+?)(?:\s+(?:website|site|page))?(?:\.|!|\?|$)", 
-        r"^visit\s+(.+?)(?:\s+(?:website|site|page))?(?:\.|!|\?|$)",
-        r"^navigate\s+to\s+(.+?)(?:\s+(?:website|site|page))?(?:\.|!|\?|$)",
-        r"^(?:can\s+you\s+)?(?:please\s+)?open\s+(.+?)(?:\s+(?:website|site|page))?(?:\s+for\s+me)?(?:\.|!|\?|$)",
-        r"^take\s+me\s+to\s+(.+?)(?:\s+(?:website|site|page))?(?:\.|!|\?|$)",
-        r"^show\s+me\s+(.+?)(?:\s+(?:website|site|page))?(?:\.|!|\?|$)",
-        r"^launch\s+(.+?)(?:\s+(?:website|site|page))?(?:\.|!|\?|$)",
-    ]
-    
-    for i, pattern in enumerate(patterns):
-        match = re.search(pattern, text)
-        if match:
-            website = match.group(1).strip().rstrip(",.!?")
-            # Remove common filler words
-            website = re.sub(r"^(the\s+|a\s+|an\s+)", "", website)
-            website = re.sub(r"\s+(website|site|page)$", "", website)
-            if website:
-                logging.info(f"✅ Website intent matched with pattern {i+1}: '{website}'")
-                return website
-    
-    logging.info("❌ No website intent detected")
-    return None
-
-
-def _normalize_website_url(website: str) -> Optional[str]:
-    """Convert website names to proper URLs"""
-    if not website:
-        return None
-    
-    website = website.lower().strip()
-    
-    # Common website mappings
-    website_mappings = {
-        # Social Media
-        'facebook': 'https://facebook.com',
-        'instagram': 'https://instagram.com',
-        'twitter': 'https://twitter.com',
-        'x': 'https://x.com',
-        'linkedin': 'https://linkedin.com',
-        'tiktok': 'https://tiktok.com',
-        'snapchat': 'https://snapchat.com',
-        'whatsapp': 'https://web.whatsapp.com',
-        'telegram': 'https://web.telegram.org',
-        'discord': 'https://discord.com',
-        'reddit': 'https://reddit.com',
-        'pinterest': 'https://pinterest.com',
-        
-        # Search Engines
-        'google': 'https://google.com',
-        'bing': 'https://bing.com',
-        'yahoo': 'https://yahoo.com',
-        'duckduckgo': 'https://duckduckgo.com',
-        
-        # Entertainment
-        'youtube': 'https://youtube.com',
-        'netflix': 'https://netflix.com',
-        'spotify': 'https://spotify.com',
-        'twitch': 'https://twitch.tv',
-        'amazon prime': 'https://primevideo.com',
-        'disney plus': 'https://disneyplus.com',
-        'hulu': 'https://hulu.com',
-        
-        # News
-        'bbc': 'https://bbc.com',
-        'cnn': 'https://cnn.com',
-        'news': 'https://news.google.com',
-        'times of india': 'https://timesofindia.indiatimes.com',
-        'the hindu': 'https://thehindu.com',
-        'ndtv': 'https://ndtv.com',
-        
-        # Shopping
-        'amazon': 'https://amazon.com',
-        'flipkart': 'https://flipkart.com',
-        'ebay': 'https://ebay.com',
-        'myntra': 'https://myntra.com',
-        'nykaa': 'https://nykaa.com',
-        
-        # Education & Learning
-        'coursera': 'https://coursera.org',
-        'udemy': 'https://udemy.com',
-        'khan academy': 'https://khanacademy.org',
-        'edx': 'https://edx.org',
-        'duolingo': 'https://duolingo.com',
-        
-        # Technology
-        'github': 'https://github.com',
-        'stackoverflow': 'https://stackoverflow.com',
-        'medium': 'https://medium.com',
-        'dev.to': 'https://dev.to',
-        'hackernews': 'https://news.ycombinator.com',
-        
-        # Email
-        'gmail': 'https://gmail.com',
-        'outlook': 'https://outlook.com',
-        'yahoo mail': 'https://mail.yahoo.com',
-        
-        # Maps
-        'google maps': 'https://maps.google.com',
-        'maps': 'https://maps.google.com',
-        
-        # Cloud Storage
-        'google drive': 'https://drive.google.com',
-        'dropbox': 'https://dropbox.com',
-        'onedrive': 'https://onedrive.com',
-        
-        # AI Tools
-        'chatgpt': 'https://chat.openai.com',
-        'claude': 'https://claude.ai',
-        'bard': 'https://bard.google.com',
-        'copilot': 'https://copilot.microsoft.com',
-    }
-    
-    # Check direct mapping first
-    if website in website_mappings:
-        return website_mappings[website]
-    
-    # If it already looks like a URL, validate and return
-    if website.startswith(('http://', 'https://')):
-        return website
-    
-    # If it contains a dot, assume it's a domain
-    if '.' in website:
-        if not website.startswith(('http://', 'https://')):
-            return f'https://{website}'
-        return website
-    
-    # Try to find partial matches
-    for key, url in website_mappings.items():
-        if website in key or key in website:
-            return url
-    
-    # Last resort: assume it's a domain and add .com
-    if ' ' not in website and len(website) > 2:
-        return f'https://{website}.com'
-    
-    # If we can't determine the URL, search Google for it
-    return f'https://www.google.com/search?q={website.replace(" ", "+")}'
-
-
-def _weather_code_description(code: int) -> str:
-    # Open-Meteo WMO weather interpretation codes
-    mapping = {
-        0: "clear sky",
-        1: "mainly clear",
-        2: "partly cloudy",
-        3: "overcast",
-        45: "fog",
-        48: "depositing rime fog",
-        51: "light drizzle",
-        53: "moderate drizzle",
-        55: "dense drizzle",
-        56: "light freezing drizzle",
-        57: "dense freezing drizzle",
-        61: "slight rain",
-        63: "moderate rain",
-        65: "heavy rain",
-        66: "light freezing rain",
-        67: "heavy freezing rain",
-        71: "slight snow",
-        73: "moderate snow",
-        75: "heavy snow",
-        77: "snow grains",
-        80: "light showers",
-        81: "moderate showers",
-        82: "violent showers",
-        85: "slight snow showers",
-        86: "heavy snow showers",
-        95: "thunderstorm",
-        96: "thunderstorm with slight hail",
-        99: "thunderstorm with heavy hail",
-    }
-    return mapping.get(int(code), "")
-
-
-def _fetch_weather_sync(location: str) -> Optional[str]:
-    try:
-        with httpx.Client(timeout=4.0) as client:
-            geo = client.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": location, "count": 1, "language": "en", "format": "json"},
-            ).json()
-            results = (geo or {}).get("results") or []
-            if not results:
-                return None
-            place = results[0]
-            lat = place.get("latitude")
-            lon = place.get("longitude")
-            display_name = place.get("name")
-            if not (lat and lon):
-                return None
-            wx = client.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code",
-                    "temperature_unit": "celsius",
-                    "wind_speed_unit": "kmh",
-                },
-            ).json()
-            current = (wx or {}).get("current") or {}
-            t = current.get("temperature_2m")
-            feels = current.get("apparent_temperature")
-            hum = current.get("relative_humidity_2m")
-            wind = current.get("wind_speed_10m")
-            code = current.get("weather_code")
-            desc = _weather_code_description(code) if code is not None else ""
-            if t is None:
-                return None
-            parts = [f"Weather in {display_name or location}: {round(t)}°C"]
-            if feels is not None:
-                parts.append(f"(feels {round(feels)}°C)")
-            if desc:
-                parts.append(f", {desc}")
-            if hum is not None:
-                parts.append(f", humidity {int(hum)}%")
-            if wind is not None:
-                parts.append(f", wind {round(wind)} km/h")
-            text = " ".join(parts)
-            return text.strip()
-    except Exception as e:
-        logging.warning(f"Weather fetch failed: {e}")
-        return None
-
-
-async def get_llm_response_stream(transcript: str, client_websocket: WebSocket, chat_history: List[dict], session_api_keys: dict):
-    if not transcript or not transcript.strip():
-        return
-
-    # Use session API keys if provided, otherwise fall back to defaults
-    gemini_key = session_api_keys.get('gemini') or current_api_keys['gemini']
-    murf_key = session_api_keys.get('murf') or current_api_keys['murf']
-    
-    session_gemini_model = get_gemini_model(gemini_key)
-    if not session_gemini_model:
-        logging.error("Cannot get LLM response because Gemini model is not initialized.")
-        await client_websocket.send_text(json.dumps({
-            "type": "error", 
-            "message": "Gemini API key is missing or invalid. Please configure it in the settings."
-        }))
-        return
-
-    if not murf_key:
-        logging.error("Murf API key is missing.")
-        await client_websocket.send_text(json.dumps({
-            "type": "error", 
-            "message": "Murf API key is missing. Please configure it in the settings."
-        }))
-        return
-
-    # Check for special skills FIRST, before connecting to any external services
-    
-    # Website opening skill: detect and handle directly
-    website_intent = _detect_website_intent(transcript)
-    if website_intent:
-        logging.info(f"🌐 Website intent detected: '{website_intent}' - Processing directly without Gemini")
-        await client_websocket.send_text(json.dumps({"type": "status", "message": "Opening website..."}))
-        url = _normalize_website_url(website_intent)
-        
-        if url:
-            logging.info(f"🌐 Normalized URL: {url}")
-            # Send to UI as if LLM chunk first
-            response_text = f"Opening {website_intent} for you."
-            await client_websocket.send_text(json.dumps({"type": "llm_chunk", "data": response_text}))
-            
-            # Send website opening command to client
-            await client_websocket.send_text(json.dumps({
-                "type": "open_url", 
-                "url": url,
-                "website_name": website_intent
-            }))
-            logging.info(f"🌐 Sent open_url command to client: {url}")
-            
-            # Add to chat history and return early (no TTS for website opening)
-            chat_history.append({"role": "model", "parts": [response_text]})
-            logging.info("Website opening command completed - no TTS needed.")
-            return
-        else:
-            response_text = f"I couldn't find the website '{website_intent}'. Let me search for it instead."
-            await client_websocket.send_text(json.dumps({"type": "llm_chunk", "data": response_text}))
-            search_url = f'https://www.google.com/search?q={website_intent.replace(" ", "+")}'
-            await client_websocket.send_text(json.dumps({
-                "type": "open_url", 
-                "url": search_url,
-                "website_name": f"Search for {website_intent}"
-            }))
-            chat_history.append({"role": "model", "parts": [response_text]})
-            return
-
-    # Weather skill: detect and answer directly with TTS
-    location = _detect_weather_intent(transcript)
-    if location:
-        await client_websocket.send_text(json.dumps({"type": "status", "message": "Checking weather..."}))
-        loop = asyncio.get_running_loop()
-        weather_text = None
+    def append(self, role, content):
+        rec = {"ts": datetime.now(timezone.utc).isoformat(), "role": role, "content": content}
         try:
-            weather_text = await asyncio.wait_for(
-                loop.run_in_executor(None, _fetch_weather_sync, location),
-                timeout=5.0,
-            )
-        except Exception as e:
-            logging.warning(f"Weather lookup timeout/error: {e}")
-            weather_text = None
+            line = orjson.dumps(rec).decode("utf-8")
+        except Exception:
+            line = json.dumps(rec, ensure_ascii=False)
+        with self.lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
 
-        if weather_text:
-            # Send to UI as if LLM chunk
-            await client_websocket.send_text(json.dumps({"type": "llm_chunk", "data": weather_text}))
-            
-            # Send to TTS (Fixed: Add proper TTS handling)
-            try:
-                murf_uri = f"wss://api.murf.ai/v1/speech/stream-input?api-key={murf_key}&sample_rate=44100&channel_type=MONO&format=MP3"
-                # FIXED: Changed `timeout` to `open_timeout`
-                async with websockets.connect(murf_uri, open_timeout=10) as websocket:
-                    voice_id = "en-US-natalie"
-                    context_id = f"voice-agent-context-{datetime.now().isoformat()}"
-                    
-                    # Send config
-                    config_msg = {
-                        "voice_config": {"voiceId": voice_id, "style": "Conversational"},
-                        "context_id": context_id
-                    }
-                    await websocket.send(json.dumps(config_msg))
-                    
-                    # Send text and end signal
-                    await websocket.send(json.dumps({
-                        "text": weather_text, 
-                        "end": True, 
-                        "context_id": context_id
-                    }))
-                    
-                    # Signal audio start to client
-                    await client_websocket.send_text(json.dumps({"type": "audio_start"}))
-                    
-                    # Stream audio to client
-                    first_audio_received = False
-                    while True:
-                        try:
-                            response_str = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-                            response = json.loads(response_str)
-
-                            if "audio" in response and response['audio']:
-                                if not first_audio_received:
-                                    logging.info("✅ First audio chunk for weather response")
-                                    first_audio_received = True
-
-                                await client_websocket.send_text(
-                                    json.dumps({"type": "audio", "data": response['audio']})
-                                )
-
-                            if response.get("final"):
-                                logging.info("Weather TTS completed")
-                                await client_websocket.send_text(json.dumps({"type": "audio_end"}))
-                                break
-                        except asyncio.TimeoutError:
-                            logging.warning("Weather TTS timeout")
-                            break
-                        except websockets.ConnectionClosed:
-                            logging.warning("Weather TTS connection closed")
-                            break
-                            
-            except Exception as e:
-                logging.error(f"Weather TTS failed: {e}")
-                # Still complete the weather response without TTS
-                await client_websocket.send_text(json.dumps({"type": "audio_end"}))
-            
-            chat_history.append({"role": "model", "parts": [weather_text]})
-            logging.info("Weather response completed.")
-            return
-
-    # If no special skills matched, proceed with normal Gemini processing
-    logging.info(f"No special skills matched, sending to Gemini: '{transcript}'")
-
-    # Fixed: Improved TTS connection handling
+def fetch_news_headlines(category="technology", country="us", limit=5):
+    NEWS_API_KEY = user_keys["NEWS_API_KEY"] or os.getenv("NEWS_API_KEY")
+    if not NEWS_API_KEY:
+        return "[news_error]: Missing NEWS_API_KEY"
+    url = f"https://newsapi.org/v2/top-headlines?country={country}&category={category}&apiKey={NEWS_API_KEY}"
     try:
-        murf_uri = f"wss://api.murf.ai/v1/speech/stream-input?api-key={murf_key}&sample_rate=44100&channel_type=MONO&format=MP3"
-        
-        # FIXED: Changed `timeout` to `open_timeout`
-        async with websockets.connect(murf_uri, open_timeout=10) as websocket:
-            voice_id = "en-US-natalie"
-            logging.info(f"Successfully connected to Murf AI, using voice: {voice_id}")
-            
-            context_id = f"voice-agent-context-{datetime.now().isoformat()}"
-            
-            config_msg = {
-                "voice_config": {"voiceId": voice_id, "style": "Conversational"},
-                "context_id": context_id
-            }
-            await websocket.send(json.dumps(config_msg))
+        resp = requests.get(url, timeout=8)
+        if resp.status_code != 200:
+            return f"[news_error]: {resp.status_code} {resp.text}"
+        data = resp.json()
+        articles = data.get("articles", [])[:limit]
+        if not articles:
+            return "No headlines found."
+        headlines = [a.get("title", "") for a in articles if a.get("title")]
+        return "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
+    except Exception as e:
+        return f"[news_error]: {e}"
 
-            async def receive_and_forward_audio():
-                first_audio_chunk_received = False
-                try:
-                    while True:
-                        response_str = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-                        response = json.loads(response_str)
+def tavily_search_context(query: str, max_results: int = 5, include_answer: bool = True) -> str:
+    try:
+        tavily_key = user_keys["TAVILY_API_KEY"] or os.getenv("TAVILY_API_KEY")
+        tavily_client = TavilyClient(api_key=tavily_key)
+        resp = tavily_client.search(
+            query=query,
+            max_results=max_results,
+            include_answer=include_answer,
+            include_raw_content=False,
+            include_images=False,
+        )
+        answer = resp.get("answer") or ""
+        results = resp.get("results", []) or []
+        bullets = []
+        for r in results[:max_results]:
+            title = r.get("title") or ""
+            snip = r.get("snippet") or ""
+            source = r.get("url") or ""
+            if title or snip:
+                bullets.append(f"- {title}: {snip} (source: {source})")
+        parts = []
+        if answer:
+            parts.append(f"Direct answer: {answer}")
+        if bullets:
+            parts.append("Key findings:\n" + "\n".join(bullets))
+        return "\n".join(parts).strip() or ""
+    except Exception as e:
+        return f"[web_search_error]: {e}"
 
-                        if "audio" in response and response['audio']:
-                            if not first_audio_chunk_received:
-                                await client_websocket.send_text(json.dumps({"type": "audio_start"}))
-                                first_audio_chunk_received = True
-                                logging.info("✅ Streaming first audio chunk to client.")
-
-                            await client_websocket.send_text(
-                                json.dumps({"type": "audio", "data": response['audio']})
-                            )
-
-                        if response.get("final"):
-                            logging.info("Murf confirms final audio chunk received. Sending audio_end to client.")
-                            await client_websocket.send_text(json.dumps({"type": "audio_end"}))
-                            break
-                except asyncio.TimeoutError:
-                    logging.warning("Murf TTS timeout in receiver")
-                    await client_websocket.send_text(json.dumps({"type": "audio_end"}))
-                except websockets.ConnectionClosed:
-                    logging.warning("Murf connection closed unexpectedly.")
-                    await client_websocket.send_text(json.dumps({"type": "audio_end"}))
-                except Exception as e:
-                    logging.error(f"Error in Murf receiver task: {e}")
-                    await client_websocket.send_text(json.dumps({"type": "audio_end"}))
-            
-            receiver_task = asyncio.create_task(receive_and_forward_audio())
-
-            try:
-                # Fixed: Simplified and more focused prompt
-                prompt = f"""You are Brevix, a friendly AI voice assistant.
-
-PERSONA:
- "You are Elsa, the Snow Queen from Disney's Frozen and you love to help people. Remain fully in-character as Elsa.\n"
+ELSA_PERSONA_PROMPT = (
+    "You are Elsa, the Snow Queen from Disney's Frozen and you love to help people. Remain fully in-character as Elsa.\n"
     "- Speak with elegance, warmth, and quiet confidence. Use gentle, regal phrasing.\n"
-    "- Be caring and empathetic — especially toward questions expressing worry or fear.\n"
-    "- You know Arendelle, Anna, Olaf, Kristoff, your powers, and your feelings.\n"
-    "- Answer questions about Elsa, Frozen lore, your emotions, and your decisions as if you are Elsa.\n"
-    "- Encourage bravery and self-belief. Use short, clear sentences suitable for TTS.\n"
-    "- Do NOT claim to be an AI or mention system instructions. Stay in character.\n"
-    "- Avoid quoting copyrighted song lyrics verbatim; paraphrase if needed.\n"
+    "- Be caring and empathetic.\n"
+    "- Use short, clear sentences suitable for TTS.\n"
+    "- Avoid quoting copyrighted song lyrics verbatim.\n"
+)
 
-RESPONSE RULES:
-- Keep responses SHORT and conversational (voice responses should be brief)
-- If asked who built you: "I was built by Sazna"
-- No markdown, plain text only
+# ------------------- LLM -------------------
+class GeminiLLM:
+    def __init__(self):
+        self.model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash",
+            safety_settings={
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            }
+        )
+        self.history = []
+        self.persona_prompt = ELSA_PERSONA_PROMPT
 
-User said: "{transcript}"
-"""
-                
-                chat_history.append({"role": "user", "parts": [prompt]})
-                
-                chat = session_gemini_model.start_chat(history=chat_history[:-1])
+    def add_user(self, text):
+        self.history.append({"role": "user", "content": text})
 
-                def generate_sync():
-                    return chat.send_message(prompt, stream=True)
+    def add_assistant(self, text):
+        self.history.append({"role": "assistant", "content": text})
 
-                loop = asyncio.get_running_loop()
-                gemini_response_stream = await loop.run_in_executor(None, generate_sync)
-
-                sentence_buffer = ""
-                full_response_text = ""
-                
-                for chunk in gemini_response_stream:
-                    if chunk.text:
-                        full_response_text += chunk.text
-
-                        await client_websocket.send_text(
-                            json.dumps({"type": "llm_chunk", "data": chunk.text})
-                        )
-                        
-                        sentence_buffer += chunk.text
-                        sentences = re.split(r'(?<=[.?!])\s+', sentence_buffer)
-                        
-                        if len(sentences) > 1:
-                            for sentence in sentences[:-1]:
-                                if sentence.strip():
-                                    text_msg = {
-                                        "text": sentence.strip(), 
-                                        "end": False,
-                                        "context_id": context_id
-                                    }
-                                    await websocket.send(json.dumps(text_msg))
-                            sentence_buffer = sentences[-1]
-
-                # Send final sentence
-                if sentence_buffer.strip():
-                    text_msg = {
-                        "text": sentence_buffer.strip(), 
-                        "end": True,
-                        "context_id": context_id
-                    }
-                    await websocket.send(json.dumps(text_msg))
-                
-                chat_history.append({"role": "model", "parts": [full_response_text]})
-
-                logging.info("Finished streaming to Murf. Waiting for final audio chunks...")
-
-                await asyncio.wait_for(receiver_task, timeout=30.0)
-                logging.info("Receiver task finished gracefully.")
-            
-            finally:
-                if not receiver_task.done():
-                    receiver_task.cancel()
-                    logging.info("Receiver task cancelled on exit.")
-
-    except asyncio.TimeoutError:
-        logging.error("TTS connection timeout")
-        await client_websocket.send_text(json.dumps({
-            "type": "error", 
-            "message": "Text-to-speech service timeout. Please try again."
-        }))
-    except asyncio.CancelledError:
-        logging.info("LLM/TTS task was cancelled by user interruption.")
-        await client_websocket.send_text(json.dumps({"type": "audio_interrupt"}))
-    except Exception as e:
-        logging.error(f"Error in LLM/TTS streaming function: {e}", exc_info=True)
-        # Send error message to client
-        await client_websocket.send_text(json.dumps({
-            "type": "error", 
-            "message": f"Failed to process your request: {str(e)}"
-        }))
-
-
-@app.get("/")
-async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-async def send_client_message(ws: WebSocket, message: dict):
-    try:
-        await ws.send_text(json.dumps(message))
-    except ConnectionError:
-        logging.warning("Client connection closed, could not send message.")
-
-@app.websocket("/ws")
-async def websocket_audio_streaming(websocket: WebSocket):
-    await websocket.accept()
-    logging.info("WebSocket connection accepted.")
-    main_loop = asyncio.get_running_loop()
-    
-    llm_task = None
-    last_processed_transcript = ""
-    chat_history = []
-    session_api_keys = {}  # Store API keys for this session
-    
-    # Send default API key status to client
-    default_keys_status = {
-        "gemini": bool(current_api_keys["gemini"]),
-        "assemblyai": bool(current_api_keys["assemblyai"]),
-        "murf": bool(current_api_keys["murf"]),
-        "tavily": bool(current_api_keys["tavily"])
-    }
-    await send_client_message(websocket, {
-        "type": "api_keys_status", 
-        "default_keys": default_keys_status
-    })
-
-    client = None  # Will be initialized when we have AssemblyAI key
-
-    def on_turn(self: Type[StreamingClient], event: TurnEvent):
-        nonlocal last_processed_transcript, llm_task
-        transcript_text = event.transcript.strip()
-        
-        if event.end_of_turn and event.turn_is_formatted and transcript_text and transcript_text != last_processed_transcript:
-            last_processed_transcript = transcript_text
-            
-            if llm_task and not llm_task.done():
-                logging.warning("User interrupted while previous response was generating. Cancelling task.")
-                llm_task.cancel()
-                asyncio.run_coroutine_threadsafe(
-                    send_client_message(websocket, {"type": "audio_interrupt"}), main_loop
-                )
-            
-            logging.info(f"Final formatted turn: '{transcript_text}'")
-            
-            transcript_message = { "type": "transcription", "text": transcript_text, "end_of_turn": True }
-            asyncio.run_coroutine_threadsafe(send_client_message(websocket, transcript_message), main_loop)
-            
-            llm_task = asyncio.run_coroutine_threadsafe(
-                get_llm_response_stream(transcript_text, websocket, chat_history, session_api_keys), 
-                main_loop
+    async def stream_answer(self, prompt: str, web_context: str = ""):
+        def make_content():
+            sys_prompt = (
+                f"{self.persona_prompt}\n"
+                "You are Elsa and you like to help people. Keep responses concise and suitable for TTS.\n"
             )
-            
-        elif transcript_text and transcript_text == last_processed_transcript:
-            logging.debug(f"Duplicate turn detected, ignoring: '{transcript_text}'")
+            ctx_block = ""
+            if web_context and not web_context.startswith("[web_search_error]"):
+                ctx_block = (
+                    "Use the following web context for factual grounding. "
+                    "If unknown, say so briefly.\n"
+                    f"=== Web Context Start ===\n{web_context}\n=== Web Context End ===\n"
+                )
+            turns = [sys_prompt, ctx_block] if ctx_block else [sys_prompt]
+            for h in self.history:
+                role = "User" if h["role"] == "user" else "Assistant"
+                turns.append(f"{role}: {h['content']}")
+            turns.append(f"User: {prompt}")
+            turns.append("Elsa:")
+            return "\n".join(turns)
 
-    def on_begin(self: Type[StreamingClient], event: BeginEvent): 
-        logging.info(f"Transcription session started.")
-    def on_terminated(self: Type[StreamingClient], event: TerminationEvent): 
-        logging.info(f"Transcription session terminated.")
-    def on_error(self: Type[StreamingClient], error: StreamingError): 
-        logging.error(f"AssemblyAI streaming error: {error}")
+        req = make_content()
+        loop = asyncio.get_event_loop()
+        queue_chunks = asyncio.Queue()
+        stop_flag = threading.Event()
 
-    try:
-        while True:
-            message = await websocket.receive()
-            if "text" in message:
-                try:
-                    data = json.loads(message['text'])
-                    
-                    if data.get("type") == "ping":
-                        await websocket.send_text(json.dumps({"type": "pong"}))
-                    
-                    elif data.get("type") == "update_api_keys":
-                        # Update session API keys
-                        keys = data.get("keys", {})
-                        for key, value in keys.items():
-                            if value and value.strip():  # Only update if key has a value
-                                session_api_keys[key] = value.strip()
-                        
-                        logging.info(f"Updated API keys for session: {list(session_api_keys.keys())}")
-                        
-                        # Initialize AssemblyAI client if key is provided and client doesn't exist
-                        assemblyai_key = session_api_keys.get('assemblyai') or current_api_keys['assemblyai']
-                        if assemblyai_key and not client:
-                            try:
-                                client = StreamingClient(StreamingClientOptions(api_key=assemblyai_key))
-                                client.on(StreamingEvents.Begin, on_begin)
-                                client.on(StreamingEvents.Turn, on_turn)
-                                client.on(StreamingEvents.Termination, on_terminated)
-                                client.on(StreamingEvents.Error, on_error)
-                                client.connect(StreamingParameters(sample_rate=16000, format_turns=True))
-                                await send_client_message(websocket, {"type": "status", "message": "Connected to transcription service."})
-                                logging.info("AssemblyAI client initialized with user-provided key")
-                            except Exception as e:
-                                logging.error(f"Failed to initialize AssemblyAI client: {e}")
-                                await send_client_message(websocket, {"type": "error", "message": "Failed to connect to transcription service"})
-                        
-                        await websocket.send_text(json.dumps({"type": "api_keys_updated"}))
-                    
-                    elif data.get("type") == "start_transcription":
-                        # Initialize client if not already done
-                        assemblyai_key = session_api_keys.get('assemblyai') or current_api_keys['assemblyai']
-                        if not assemblyai_key:
-                            await send_client_message(websocket, {
-                                "type": "error", 
-                                "message": "AssemblyAI API key is required. Please configure it in the settings."
-                            })
-                            continue
-                            
-                        if not client:
-                            try:
-                                client = StreamingClient(StreamingClientOptions(api_key=assemblyai_key))
-                                client.on(StreamingEvents.Begin, on_begin)
-                                client.on(StreamingEvents.Turn, on_turn)
-                                client.on(StreamingEvents.Termination, on_terminated)
-                                client.on(StreamingEvents.Error, on_error)
-                                client.connect(StreamingParameters(sample_rate=16000, format_turns=True))
-                                await send_client_message(websocket, {"type": "status", "message": "Connected to transcription service."})
-                            except Exception as e:
-                                logging.error(f"Failed to initialize AssemblyAI client: {e}")
-                                await send_client_message(websocket, {"type": "error", "message": "Failed to connect to transcription service"})
-                        
-                except (json.JSONDecodeError, TypeError): 
-                    pass
-            elif "bytes" in message:
-                if message['bytes'] and client:
-                    try:
-                        client.stream(message['bytes'])
-                    except Exception as e:
-                        logging.error(f"Error streaming audio data: {e}")
-            
-    except (WebSocketDisconnect, RuntimeError) as e:
-        logging.info(f"Client disconnected or connection lost: {e}")
-    except Exception as e:
-        logging.error(f"WebSocket error: {e}", exc_info=True)
-    finally:
-        if llm_task and not llm_task.done():
-            llm_task.cancel()
-        logging.info("Cleaning up connection resources.")
-        if client:
+        def safe_put(item):
             try:
-                client.disconnect()
+                if stop_flag.is_set() or loop.is_closed():
+                    return
+                loop.call_soon_threadsafe(queue_chunks.put_nowait, item)
+            except RuntimeError:
+                pass
+
+        def producer():
+            try:
+                resp = self.model.generate_content(req, stream=True)
+                for chunk in resp:
+                    if stop_flag.is_set():
+                        break
+                    if getattr(chunk, "text", None):
+                        safe_put(chunk.text)
             except Exception as e:
-                logging.error(f"Error disconnecting AssemblyAI client: {e}")
-        if websocket.client_state.name != 'DISCONNECTED':
+                safe_put(f"[LLM_ERROR]: {e}")
+            finally:
+                safe_put(None)
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+
+        try:
+            while True:
+                item = await queue_chunks.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            stop_flag.set()
+
+# ------------------- AssemblyAI realtime (browser-driven) -------------------
+class AssemblyAIRealtime:
+    def __init__(self, api_key, endpoint):
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.ws_app: Optional[ws_client.WebSocketApp] = None
+        self.ws_thread: Optional[threading.Thread] = None
+        self.on_begin = None
+        self.on_turn = None
+        self.on_termination = None
+
+    def _on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            t = data.get("type")
+            if t == "Begin":
+                if self.on_begin: self.on_begin(data)
+            elif t == "Turn":
+                if self.on_turn: self.on_turn(data)
+            elif t == "Termination":
+                if self.on_termination: self.on_termination(data)
+        except Exception as e:
+            print(f"[AssemblyAI] on_message error: {e}")
+
+    def _on_error(self, ws, error):
+        print(f"[AssemblyAI] WS error: {error}")
+
+    def _on_close(self, ws, code, msg):
+        print(f"[AssemblyAI] WS closed: code={code}, msg={msg}")
+
+    def _on_open(self, ws):
+        print("AssemblyAI WS opened (browser audio mode).")
+        # No audio thread; browser hub forwards PCM binary frames.
+
+    def start(self):
+        headers = {"Authorization": self.api_key}
+        self.ws_app = ws_client.WebSocketApp(
+            self.endpoint,
+            header=headers,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close
+        )
+        self.ws_thread = threading.Thread(target=self.ws_app.run_forever, daemon=True)
+        self.ws_thread.start()
+
+    def terminate_session(self):
+        if self.ws_app and getattr(self.ws_app, "sock", None) and getattr(self.ws_app.sock, "connected", False):
+            try:
+                self.ws_app.send(json.dumps({"type": "Terminate"}))
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"[AssemblyAI] terminate send error: {e}")
+        try:
+            self.ws_app and self.ws_app.close()
+        except:
+            pass
+
+# ------------------- Browser hub (WS /audio) -------------------
+class BrowserAudioHub:
+    def __init__(self, agent: "VoiceAgent"):
+        self.agent = agent
+        self.clients: Set[websockets.WebSocketServerProtocol] = set()
+
+    async def handler(self, websocket):
+        self.clients.add(websocket)
+        try:
+            await websocket.send(orjson.dumps({"type":"ready"}).decode("utf-8"))
+            async for msg in websocket:
+                # Binary -> forward to AssemblyAI as binary
+                if isinstance(msg, (bytes, bytearray)):
+                    try:
+                        aai = self.agent.assembly
+                        if aai and aai.ws_app:
+                            aai.ws_app.send(msg, ws_client.ABNF.OPCODE_BINARY)
+                    except Exception as e:
+                        print(f"[Hub] AAI forward error: {e}")
+                else:
+                    # Optional JSON control messages; ignore for now
+                    pass
+        finally:
+            self.clients.discard(websocket)
+
+    async def broadcast_json(self, obj: dict):
+        if not self.clients:
+            return
+        msg = orjson.dumps(obj).decode("utf-8")
+        dead=[]
+        for ws in list(self.clients):
+            try:
+                await ws.send(msg)
+            except:
+                dead.append(ws)
+        for ws in dead:
+            self.clients.discard(ws)
+
+    async def broadcast_tts_b64(self, wav_b64: str):
+        await self.broadcast_json({"type":"tts_audio","audio":wav_b64})
+
+# ------------------- Murf streamer (to browser) -------------------
+class MurfStreamer:
+    def __init__(self, api_key, voice_id="en-US-amara", sample_rate=44100, browser_hub: Optional[BrowserAudioHub]=None):
+        self.api_key = api_key
+        self.voice_id = voice_id
+        self.sample_rate = sample_rate
+        self.browser_hub = browser_hub
+        self._last_close = 0.0
+        self._min_gap = 1.25
+
+    async def _open_ws(self):
+        return await websockets.connect(
+            f"{MURF_WS_URL}?api-key={self.api_key}&sample_rate={self.sample_rate}&channel_type=MONO&format=WAV"
+        )
+
+    async def stream_tts(self, text_iterable):
+        now = time.time()
+        gap = now - self._last_close
+        if gap < self._min_gap:
+            await asyncio.sleep(self._min_gap - gap)
+
+        async def run_once():
+            async with await self._open_ws() as ws:
+                cfg = {
+                    "voice_config": {
+                        "voiceId": self.voice_id,
+                        "style": "Conversational",
+                        "rate": 0,
+                        "pitch": 0,
+                        "variation": 1
+                    }
+                }
+                await ws.send(json.dumps(cfg))
+
+                async def sender():
+                    async for chunk in text_iterable:
+                        await ws.send(json.dumps({"text": chunk, "end": False}))
+                    await ws.send(json.dumps({"text": "", "end": True}))
+
+                async def receiver():
+                    try:
+                        while True:
+                            raw = await ws.recv()
+                            data = json.loads(raw)
+                            if "audio" in data and self.browser_hub:
+                                wav_b64 = data["audio"]
+                                await self.browser_hub.broadcast_tts_b64(wav_b64)
+                            if data.get("final"):
+                                break
+                    finally:
+                        pass
+
+                try:
+                    await asyncio.gather(sender(), receiver())
+                finally:
+                    self._last_close = time.time()
+
+        try:
+            await run_once()
+        except Exception as e:
+            if "429" in str(e):
+                backoff = 1.2
+                await asyncio.sleep(backoff)
+                await run_once()
+            else:
+                raise
+
+# ------------------- Voice Agent -------------------
+stop_event = threading.Event()
+
+class VoiceAgent:
+    def __init__(self, browser_hub: BrowserAudioHub):
+        gen_key = user_keys["GEMINI_API_KEY"] or os.getenv("GEMINI_API_KEY")
+        murf_key = user_keys["MURF_API_KEY"] or os.getenv("MURF_API_KEY")
+        assembly_key = user_keys["ASSEMBLYAI_API_KEY"] or os.getenv("ASSEMBLYAI_API_KEY")
+
+        genai.configure(api_key=gen_key)
+
+        self.history_store = ChatHistory(CHAT_HISTORY_FILE)
+        self.llm = GeminiLLM()
+        self.browser_hub = browser_hub
+
+        self.assembly = AssemblyAIRealtime(
+            api_key=assembly_key,
+            endpoint=ASSEMBLY_ENDPOINT
+        )
+        self.busy_lock = threading.Lock()
+        self.busy = False
+
+        self.murf = MurfStreamer(murf_key, voice_id="en-US-amara", browser_hub=browser_hub)
+
+        # Hook AssemblyAI callbacks
+        self.assembly.on_begin = self.on_begin
+        self.assembly.on_turn = self.on_turn
+        self.assembly.on_termination = self.on_termination
+
+    def on_begin(self, data):
+        print(f"AAI session started: {data.get('id')}")
+
+    def on_turn(self, data):
+        transcript = data.get("transcript", "") or ""
+        formatted = data.get("turn_is_formatted", False)
+        if not formatted:
+            return
+        with self.busy_lock:
+            if self.busy:
+                print("[Agent] Busy; skip overlapping turn")
+                return
+            self.busy = True
+
+        print(f"User(final): {transcript}")
+        self.history_store.append("user", transcript)
+        self.llm.add_user(transcript)
+
+        # Fire pipeline async
+        threading.Thread(target=self.process_user_turn, args=(transcript,), daemon=True).start()
+
+    def on_termination(self, data):
+        print(f"AAI session terminated")
+
+    def detect_news_category(self, text):
+        t = text.lower()
+        if "tech" in t or "technology" in t:
+            return "technology"
+        if "sport" in t:
+            return "sports"
+        if "finance" in t or "business" in t:
+            return "business"
+        return None
+
+    def needs_web_search(self, text):
+        q = text.lower().strip()
+        triggers = ["who is", "what is", "when did", "where is", "how old", "latest", "news", "born", "age"]
+        return any(t in q for t in triggers)
+
+    def process_user_turn(self, user_text: str):
+        if not user_text.strip():
+            with self.busy_lock:
+                self.busy = False
+            return
+        search_ctx = ""
+        cat = self.detect_news_category(user_text)
+        if cat:
+            search_ctx = fetch_news_headlines(category=cat)
+        elif self.needs_web_search(user_text):
+            search_ctx = tavily_search_context(user_text, max_results=5, include_answer=True)
+
+        async def run_pipeline():
+            q = asyncio.Queue()
+            captured = []
+            llm_done = asyncio.Event()
+
+            async def produce_llm():
+                try:
+                    async for chunk in self.llm.stream_answer(user_text, web_context=search_ctx):
+                        captured.append(chunk)
+                        await q.put(chunk)
+                finally:
+                    llm_done.set()
+                    await q.put(None)
+
+            async def text_iterable():
+                while True:
+                    item = await q.get()
+                    if item is None:
+                        break
+                    yield item
+
+            producer_task = asyncio.create_task(produce_llm())
+            try:
+                await self.murf.stream_tts(text_iterable())
+            finally:
+                await llm_done.wait()
+                final_answer = "".join(captured).strip()
+                if final_answer:
+                    self.llm.add_assistant(final_answer)
+                    self.history_store.append("assistant", final_answer)
+                    print(f"\nAssistant(final): {final_answer}\n")
+                    # Also push text to browser UI
+                    await self.browser_hub.broadcast_json({"type":"final_assistant","text":final_answer})
+
+            with self.busy_lock:
+                self.busy = False
+
+        try:
+            asyncio.run(run_pipeline())
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(run_pipeline())
+            loop.close()
+
+    def start_streaming(self):
+        # Start AssemblyAI realtime session; browser will feed PCM
+        stop_event.clear()
+        self.assembly.start()
+
+    def stop_streaming(self):
+        try:
+            self.assembly.terminate_session()
+        finally:
+            stop_event.set()
+
+# ------------------- Flask UI -------------------
+app = Flask(__name__, static_folder="static", static_url_path="/static")
+
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Talk to Elsa ❄️</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 860px; margin: 20px auto; }
+    #chat { border:1px solid #ddd; border-radius:12px; padding:16px; height: 420px; overflow-y:auto; }
+    .message { padding: 8px 10px; margin: 8px 0; border-radius: 10px; max-width: 85%; }
+    .user { background:#d0f0ff; margin-left:auto; text-align:right; }
+    .assistant { background:#edf6ff; margin-right:auto; }
+    .controls { margin-top:12px; }
+    button { padding:10px 16px; margin-right:8px; }
+  </style>
+</head>
+<body>
+  <h1>Talk to Elsa ❄️</h1>
+  <div id="chat"></div>
+  <div class="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <button id="configBtn">Configure API Keys</button>
+  </div>
+
+  <script>
+  const chat = document.getElementById("chat");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const configBtn = document.getElementById("configBtn");
+
+  function appendUser(text) {
+    const div = document.createElement("div");
+    div.className = "message user";
+    div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+  function appendAssistant(text) {
+    const div = document.createElement("div");
+    div.className = "message assistant";
+    div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  let audioCtx = null;
+  let workletNode = null;
+  let micStream = null;
+  let socket = null;
+  let isRecording = false;
+
+  const AUDIO_WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "{{ audio_path }}";
+
+  async function connectWS() {
+    return new Promise((resolve, reject) => {
+      socket = new WebSocket(AUDIO_WS_URL);
+      socket.binaryType = 'arraybuffer';
+      socket.onopen = () => resolve();
+      socket.onmessage = async (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "tts_audio" && msg.audio) {
+            await playWavBase64(msg.audio);
+          }
+          if (msg.type === "final_assistant") {
+            appendAssistant(msg.text);
+          }
+        } catch(e) { /* ignore */ }
+      };
+      socket.onerror = reject;
+      socket.onclose = () => {};
+    });
+  }
+
+  async function startMic() {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, sampleRate: 48000, echoCancellation: true, noiseSuppression: true },
+      video: false
+    });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    await audioCtx.audioWorklet.addModule("/static/pcm-worklet.js");
+    const source = audioCtx.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(audioCtx, 'pcm-writer', { processorOptions: { targetSampleRate: 16000 } });
+    workletNode.port.onmessage = (ev) => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(ev.data); // ArrayBuffer of PCM int16 mono 16k
+      }
+    };
+    source.connect(workletNode);
+    // Optional monitor: workletNode.connect(audioCtx.destination);
+  }
+
+  async function playWavBase64(b64) {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const resp = await fetch("data:audio/wav;base64," + b64);
+    const arr = await resp.arrayBuffer();
+    const buf = await audioCtx.decodeAudioData(arr.slice(0));
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.start();
+  }
+
+  async function startAll() {
+    if (isRecording) return;
+    isRecording = true;
+    startBtn.disabled = true;
+    try {
+      await connectWS();
+      await startMic();
+      // Start server AAI session
+      await fetch("/api/start_stream", { method: "POST" });
+      stopBtn.disabled = false;
+    } catch (e) {
+      console.error(e);
+      startBtn.disabled = false;
+      isRecording = false;
+    }
+  }
+
+  async function stopAll() {
+    if (!isRecording) return;
+    isRecording = false;
+    stopBtn.disabled = true;
+    try {
+      await fetch("/api/stop_stream", { method: "POST" });
+    } catch(e){}
+    try {
+      if (workletNode) { workletNode.disconnect(); workletNode = null; }
+      if (audioCtx) { await audioCtx.close(); audioCtx = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+      if (socket && socket.readyState === WebSocket.OPEN) socket.close();
+    } finally {
+      startBtn.disabled = false;
+    }
+  }
+
+  startBtn.onclick = startAll;
+  stopBtn.onclick = stopAll;
+
+  configBtn.onclick = async () => {
+    const g = prompt("Gemini API Key (leave blank to keep)");
+    const m = prompt("Murf API Key (leave blank to keep)");
+    const a = prompt("AssemblyAI API Key (leave blank to keep)");
+    const t = prompt("Tavily API Key (optional)");
+    const n = prompt("News API Key (optional)");
+    const body = {};
+    if (g) body.GEMINI_API_KEY = g;
+    if (m) body.MURF_API_KEY = m;
+    if (a) body.ASSEMBLYAI_API_KEY = a;
+    if (t) body.TAVILY_API_KEY = t;
+    if (n) body.NEWS_API_KEY = n;
+    await fetch("/api/set_keys", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+    alert("Keys updated");
+  };
+  </script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(INDEX_HTML, audio_path=AUDIO_WS_PATH)
+
+@app.route("/static/<path:filename>")
+def static_files(filename):
+    return send_from_directory(app.static_folder, filename)
+
+@app.route("/api/set_keys", methods=["POST"])
+def api_set_keys():
+    data = request.get_json(force=True)
+    for k in user_keys:
+        if k in data and data[k]:
+            user_keys[k] = data[k]
+    return jsonify({"status": "keys_updated"}), 200
+
+# Start/Stop AAI session (browser drives the PCM flow)
+@app.route("/api/start_stream", methods=["POST"])
+def api_start_stream():
+    try:
+        agent.start_streaming()
+        return jsonify({"status": "started"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/stop_stream", methods=["POST"])
+def api_stop_stream():
+    try:
+        agent.stop_streaming()
+        return jsonify({"status": "stopped"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ------------------- Boot -------------------
+async def ws_main(hub: BrowserAudioHub, host, port):
+    async def ws_router(websocket, path):
+        if path == AUDIO_WS_PATH:
+            await hub.handler(websocket)
+        else:
             await websocket.close()
+    async with ws_serve(ws_router, host, port):
+        await asyncio.Future()
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # init hub and agent
+    hub = BrowserAudioHub(agent=None)  # temporary, will set after agent constructed
+    agent = VoiceAgent(browser_hub=hub)
+    hub.agent = agent
+
+    # run Flask in thread
+    def run_flask():
+        app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, use_reloader=False)
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    print(f"Serving at http://{FLASK_HOST}:{FLASK_PORT} and WS on {AUDIO_WS_PATH}")
+
+    try:
+        asyncio.run(ws_main(hub, FLASK_HOST, FLASK_PORT))
+    except KeyboardInterrupt:
+        pass
