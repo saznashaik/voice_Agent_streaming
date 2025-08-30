@@ -13,3 +13,5 @@ tavily-python==0.3.8
 
 # Local-only audio (do not install on Render); enable via LOCAL_AUDIO=true locally
 # pyaudio==0.2.14
+
+pymongo==4.8.0
